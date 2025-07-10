@@ -1,0 +1,319 @@
+---
+title: "Market Sizing with Cluster Analysis"
+author: "Alex Benecke"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{css, echo=FALSE}
+pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+pre[class] {
+  max-height: 100px;
+}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE, message = FALSE)
+```
+
+## Project Approach
+
+Market expansion involves many moving parts, including generating an analysis of the size of your new market. In order to prepare as a company, it is important to understand how likely a given product is to sell in new areas. This can be achieved by gaining insights into what factors may predict product sales in your current market, especially factors you can get about the new market you are entering. 
+
+In this analysis, I will use publicly available data to group market areas with similar demographic characteristics. Then, product sales will be compared between these groups to examine if meaningful differences exist. That is, **do existing market areas comprised of similar population demographics interact with the product in predictable ways?**
+
+If market areas can be grouped in this way, we can examine demographics in the new market to see what group each best falls into. **Group behaviors can be used to estimate product sales in the new similar markets.** The advantage of this approach is that it relies only on publicly available data when moving into new areas.
+
+In short, the aim of this analytical approach is to use what we do know (publicly-available data) to predict what we don't know (what product sales might look like in a new market) by sorting similar markets into a finite set of groups.
+
+## Project data
+
+Demographic data will be gathered from the US Census. Company sales data will be represented by a Kaggle dataset on electric vehicles (EVs) available for Washington state. For this scenario, we will predict EV sales in Ohio (proposed new market).
+
+First, the US Census data is accessed via API. For this analysis, Table DP03 *Selected Economic Characteristics* is used. Specifically, the API call grabs all data from DP03 from the 2023 5-year ACS estimates at the census tract level for every census tract in Washington (existing market) and Ohio (new market). Only percentage estimates will be retained.
+
+Let's take a look at what the initial data pull looks like after some quick manipulation to get each state-level dataset into a tidy format:
+
+```{r scripting}
+
+setwd("/cloud/project/market_sizing_analysis")
+library(tidyverse)
+library(jsonlite)
+library(cluster)
+library(factoextra)
+library(tigris)
+
+
+# Get data ----------------------------------------------------------------
+
+# Use API to retrieve: all of DP03 from US Census for Ohio
+data <- fromJSON(url("https://api.census.gov/data/2023/acs/acs5/profile?get=group(DP03)&ucgid=pseudo(0400000US39$1400000)&descriptive=true"))
+data <- as.data.frame(data)
+colnames(data) <- data[1,]
+data <- data[-1,]
+data <- data %>%
+  select(GEO_ID,NAME,ends_with("PE"))
+
+metadata <- data[1,]
+metadata <- metadata %>%
+  pivot_longer(everything(),names_to="metric",values_to="description")
+data <- data[-1,]
+
+data2 <- fromJSON(url("https://api.census.gov/data/2023/acs/acs5/profile?get=group(DP03)&ucgid=pseudo(0400000US53$1400000)&descriptive=true"))
+data2 <- as.data.frame(data2)
+colnames(data2) <- data2[1,]
+data2 <- data2[-1,]
+data2 <- data2 %>%
+  select(GEO_ID,NAME,ends_with("PE"))
+data2 <- data2[-1,]
+
+# Examine dataframe
+str(data2)
+
+```
+
+There are a few notable issues to fix:
+
+1. All data is currently of the type character (chr), so most variables should be converted to numeric. 
+2. Additionally, there are instances of a filler value ("-888888888"). These should be replaced with NA values.
+3. Most cluster algorithms don't deal well with missing data.
+
+Resulting structure of the dataframe after cleaning up the first two issues:
+
+```{r cleaning}
+neg_to_na <- function(x) {
+  ifelse(x<0,NA,x)
+}
+
+# convert to numeric & change negatives to NAs
+data_clean <- data %>%
+  union(data2) %>%
+  mutate(across(c(DP03_0001PE:DP03_0137PE), as.numeric)) %>% 
+  mutate(across(c(DP03_0001PE:DP03_0137PE), neg_to_na)) 
+nrow(data_clean)
+
+```
+
+Let's deal with the 3rd data cleaning issue by looking at the number of NA values for each variable.
+
+```{r navals}
+# look at NAs
+na_sums <- data_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "na_count")
+
+na_sums %>%
+  arrange(desc(na_count)) %>%
+  print(n=139)
+
+```
+
+We can remove variables with a large number of NAs. Then, we will scale the data to prepare for clustering.
+
+```{r removenas}
+# remove variables with >40 NAs
+vars_keep <- na_sums %>%
+  filter(na_count<=40)
+data_clean <- data_clean %>%
+  select(vars_keep$column) %>%
+  na.omit()
+nrow(data_clean)
+
+# prep data for clustering
+data_clust <- data_clean %>%
+  mutate(across(where(is.numeric), 
+                ~ as.numeric(scale(.x))))
+str(data_clean)
+```
+
+## K-means clustering
+
+There are multiple ways to determine how many clusters to use for K-means cluster algorithms. One common way is to look at what is called an elbow plot, or plotting the Within-Cluster Sum of Squares (*WCSS*) for a range of possible number of clusters (*k*).
+
+The optimal number of clusters is the point where increasing *k* provides less of a decrease in *WCSS*. Essentially, we are looking for the subjective point of diminishing returns.
+
+```{r elbow}
+# create plot of number of clusters vs total within sum of squares
+fviz_nbclust(data_clust[3:103], kmeans, method = "wss")
+
+```
+
+It is not always a clear decision. In this case, let's select 5 as the point of diminishing returns. Next, time to build the k-means model with *k*=5. The model will output a cluster assignment for each census tract (i.e. 1 through 5).
+
+```{r kmeans}
+# perform k-means clustering with k = 5 clusters
+set.seed(17)
+km <- kmeans(data_clust[3:103], centers = 5, nstart = 25)
+
+# add cluster assignment to data
+final_data <- cbind(data_clean, cluster = km$cluster)
+
+```
+
+## Examine Clusters
+
+One downside to traditional k-means clustering is that we don't know upfront how much each variable impacted the categorization. It can be helpful to examine cluster averages for the variables we used for the clustering to gain insight into what ways the cluster members are similar to one another and different from the other clusters.
+
+First of all, let's see how many census tracts ended up in each cluster:
+
+```{r clusters}
+table(final_data$cluster)
+
+```
+
+Next, let's do an overview by each demographic variable:
+
+```{r sums_clusts, echo=F}
+cluster_sums1 <- final_data %>%
+  group_by(cluster) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  select(cluster,DP03_0001PE:DP03_0022PE) %>%
+  pivot_longer(!cluster, names_to="metric",values_to="value") %>%
+  left_join(metadata,by="metric")
+
+cluster_sums2 <- final_data %>%
+  group_by(cluster) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  select(cluster,DP03_0023PE:DP03_0043PE) %>%
+  pivot_longer(!cluster, names_to="metric",values_to="value") %>%
+  left_join(metadata,by="metric")
+
+cluster_sums3 <- final_data %>%
+  group_by(cluster) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  select(cluster,DP03_0044PE:DP03_0066PE) %>%
+  pivot_longer(!cluster, names_to="metric",values_to="value") %>%
+  left_join(metadata,by="metric")
+
+cluster_sums4 <- final_data %>%
+  group_by(cluster) %>%
+  summarise(across(where(is.numeric), mean)) %>%
+  select(cluster,DP03_0068PE:DP03_0099PE) %>%
+  pivot_longer(!cluster, names_to="metric",values_to="value") %>%
+  left_join(metadata,by="metric")
+```
+
+### Cluster Summaries {.tabset}
+
+Split across tabs to make visualization easier.
+
+#### Variables 1:20
+
+```{r}
+ggplot(cluster_sums1,aes(x=cluster,y=value)) +
+  geom_col() +
+  facet_wrap(~metric,scales="free") +
+  labs(x="",y="")
+
+```
+
+#### Variables 21:40
+
+```{r}
+ggplot(cluster_sums2,aes(x=cluster,y=value)) +
+  geom_col() +
+  facet_wrap(~metric,scales="free") +
+  labs(x="",y="")
+
+```
+
+#### Variables 41:60
+
+```{r, echo=F}
+ggplot(cluster_sums3,aes(x=cluster,y=value)) +
+  geom_col() +
+  facet_wrap(~metric,scales="free") +
+  labs(x="",y="")
+
+```
+
+#### Variables 61:81
+
+```{r, echo=F}
+ggplot(cluster_sums4,aes(x=cluster,y=value)) +
+  geom_col() +
+  facet_wrap(~metric,scales="free") +
+  labs(x="",y="")
+
+```
+
+
+### Geography
+
+Now, let's get into the geography visualizations. How do these categorizations appear on maps of each market,?
+
+```{r mapswa}
+
+# Washington
+wa_tracts <- tracts("WA")
+wa_tracts <- final_data %>%
+  select(GEO_ID,cluster) %>%
+  right_join(wa_tracts,by=c("GEO_ID"="GEOIDFQ"))
+
+table(wa_tracts$cluster,useNA="ifany")
+
+plot(wa_tracts$geometry)
+
+ggplot() +
+  geom_sf(data = wa_tracts, aes(fill = as.factor(cluster),geometry = geometry)) +
+  labs(fill="Cluster") +
+  theme(
+    panel.background = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+```
+
+```{r mapsoh}
+
+# Ohio
+oh_tracts <- tracts("OH")
+oh_tracts <- final_data %>%
+  select(GEO_ID,cluster) %>%
+  right_join(oh_tracts,by=c("GEO_ID"="GEOIDFQ"))
+
+table(oh_tracts$cluster,useNA="ifany")
+
+plot(oh_tracts$geometry)
+
+ggplot() +
+  geom_sf(data = oh_tracts, aes(fill = as.factor(cluster),geometry = geometry)) +
+  labs(fill="Cluster") +
+  theme(
+    panel.background = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+```
+
+## Bring in Product Data
+
+Now that we have worked with the publicly-available Census data to create clusters of census tracts, it is time to test our hypothesis: **do existing market areas comprised of similar population demographics interact with the product in predictable ways?**
+
+**COMING SOON**
+
+## Predicting Ohio Market
+
+**COMING SOON**
+
+<!-- ## Wrap Up -->
+
+<!-- summary of the project and what we learned -->
+
+<!-- ## Caveats -->
+
+<!-- list out assumptions of the model/approach -->
+
+<!-- ## Next Steps -->
+
+<!-- talk about tapping into feature importance and clustering -->
+
